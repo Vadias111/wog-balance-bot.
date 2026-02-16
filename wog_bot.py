@@ -9,7 +9,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # Порог можно оставить здесь или тоже вынести в секреты
-BALANCE_THRESHOLD = 1000.0
+BALANCE_THRESHOLD = 110000.0
 # --- КОНЕЦ НАСТРОЕК ---
 
 # Настройка логирования для вывода информации в консоль
@@ -66,3 +66,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
