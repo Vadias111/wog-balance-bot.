@@ -10,7 +10,7 @@ TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
 TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
 
 # Порог можно оставить здесь или тоже вынести в секреты
-BALANCE_THRESHOLD = 110000.0
+BALANCE_THRESHOLD = 1000.0
 # --- КОНЕЦ НАСТРОЕК ---
 
 # Настройка логирования для вывода информации в консоль
@@ -52,11 +52,13 @@ def main():
 
         response_data = response.json()
         if response_data.get("status") == 0 and "remains" in response_data:
-            uah_wallet = next((wallet for wallet in response_data["remains"] if wallet.get("GoodsName") == "Грн"), None)
+            # Находим ВСЕ гривневые кошельки, а не только первый
+            uah_wallets = [wallet for wallet in response_data["remains"] if wallet.get("GoodsName") == "Грн"]
 
-            if uah_wallet:
-                current_balance = float(uah_wallet.get("Value", 0.0))
-                logging.info(f"Текущий баланс: {current_balance:.2f} грн.")
+            if uah_wallets:
+                # Суммируем балансы всех найденных кошельков
+                current_balance = sum(float(wallet.get("Value", 0.0)) for wallet in uah_wallets)
+                logging.info(f"Общий баланс: {current_balance:.2f} грн.")
 
                 if current_balance < BALANCE_THRESHOLD:
                     message = (
@@ -66,10 +68,9 @@ def main():
                         f"Установленный порог: *{BALANCE_THRESHOLD:.2f} грн.*\n\n"
                         f"Пора пополнить счет!"
                     )
-                    # Отправляем сообщение в Telegram через новую функцию
                     send_telegram_message(TELEGRAM_API_URL, message, TELEGRAM_CHAT_ID)
                 else:
-                    logging.info("Баланс в норме.")
+                    logging.info(f"Баланс в норме (больше или равен {BALANCE_THRESHOLD:.2f} грн).")
             else:
                 logging.warning("Гривневый кошелек не найден в ответе API.")
         else:
