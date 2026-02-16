@@ -16,6 +16,20 @@ BALANCE_THRESHOLD = 110000.0
 # Настройка логирования для вывода информации в консоль
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
+def send_telegram_message(api_url, message, chat_id):
+    """Отправляет сообщение в Telegram и проверяет результат."""
+    payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'}
+    try:
+        response = requests.post(api_url, data=payload)
+        # Проверяем, что Telegram API вернул успешный статус
+        if response.status_code == 200:
+            logging.info("Уведомление в Telegram успешно отправлено.")
+        else:
+            # Логируем ошибку от Telegram
+            logging.error(f"Ошибка отправки в Telegram: {response.status_code} - {response.text}")
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Сетевая ошибка при отправке в Telegram: {e}")
+
 def main():
     """Основная функция, которая выполняет всю логику."""
     if not all([WOG_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
@@ -52,10 +66,8 @@ def main():
                         f"Установленный порог: *{BALANCE_THRESHOLD:.2f} грн.*\n\n"
                         f"Пора пополнить счет!"
                     )
-                    # Отправляем сообщение в Telegram
-                    payload = {'chat_id': TELEGRAM_CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
-                    requests.post(TELEGRAM_API_URL, data=payload)
-                    logging.info("Уведомление о низком балансе отправлено.")
+                    # Отправляем сообщение в Telegram через новую функцию
+                    send_telegram_message(TELEGRAM_API_URL, message, TELEGRAM_CHAT_ID)
                 else:
                     logging.info("Баланс в норме.")
             else:
@@ -70,4 +82,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
