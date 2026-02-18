@@ -3,9 +3,9 @@ import json
 import logging
 import datetime as dt
 from decimal import Decimal, InvalidOperation
+from zoneinfo import ZoneInfo
 
 import requests
-from zoneinfo import ZoneInfo
 
 
 # --- ENV ---
@@ -16,18 +16,24 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "110000.00"))
 WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
 
-# WalletsRemains использует WalletCode (UUID), а не WalletId
+# Для WalletsRemains нужен WalletCode (UUID), не WalletId
 WOG_WALLET_CODE = os.environ.get("WOG_WALLET_CODE") or os.environ.get("WOG_WALLET_ID")
 
-# OPENING - только остаток на начало дня
-# OPENING_PLUS_TX - остаток на начало дня + транзакции за день (оценка)
+# OPENING - остаток на начало дня
+# OPENING_PLUS_TX - остаток на начало дня + дельта транзакций за день
 WOG_BALANCE_MODE = os.environ.get("WOG_BALANCE_MODE", "OPENING_PLUS_TX").upper()
 
-# Ключевые слова для входящих операций (если в транзакции нет явного направления)
+# Не учитывать "pending" транзакции, где по доке данные еще не готовы
+WOG_INCLUDE_PENDING_TX = os.environ.get("WOG_INCLUDE_PENDING_TX", "0") == "1"
+
+# Ключевые слова для входящих операций (если нет явного направления)
 WOG_CREDIT_KEYWORDS = [
-    w.strip().lower()
-    for w in os.environ.get("WOG_CREDIT_KEYWORDS", "попов,зарах,возврат,повернен,коригув").split(",")
-    if w.strip()
+    x.strip().lower()
+    for x in os.environ.get(
+        "WOG_CREDIT_KEYWORDS",
+        "попов,зарах,возврат,повернен,коригув"
+    ).split(",")
+    if x.strip()
 ]
 
 DEBUG_WOG = os.environ.get("DEBUG_WOG", "0") == "1"
@@ -55,8 +61,8 @@ def fmt_money(amount: Decimal) -> str:
     return f"{amount:,.2f}".replace(",", " ")
 
 
-def norm(s: str) -> str:
-    return " ".join(str(s or "").strip().lower().split())
+def norm(v: str) -> str:
+    return " ".join(str(v or "").strip().lower().split())
 
 
 def now_in_tz() -> dt.datetime:
@@ -68,11 +74,7 @@ def now_in_tz() -> dt.datetime:
 
 
 def send_telegram_message(api_url: str, message: str, chat_id: str) -> None:
-    payload = {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
+    payload = {"chat_id": chat_id, "text": message, "parse_mode": "Markdown"}
     try:
         r = requests.post(api_url, data=payload, timeout=REQUEST_TIMEOUT)
         if r.status_code == 200:
@@ -131,10 +133,26 @@ def select_wallet(uah_wallets: list[dict]) -> dict:
     return uah_wallets[0]
 
 
-def transaction_signed_amount(tx: dict) -> Decimal:
-    amount = parse_decimal(tx.get("summwithdiscount", tx.get("sum", 0)))
-    if amount == Decimal("-1"):
-        amount = parse_decimal(tx.get("sum", 0))
+def get_tx_amount(tx: dict):
+    summ_with_discount = parse_decimal(tx.get("summwithdiscount", -1))
+    discount = parse_decimal(tx.get("discount", 0))
+    raw_sum = parse_decimal(tx.get("sum", 0))
+
+    # По документации: -1 = данных еще нет (до 24 часов)
+    if not WOG_INCLUDE_PENDING_TX and (
+        summ_with_discount == Decimal("-1") or discount == Decimal("-1")
+    ):
+        return None
+
+    if summ_with_discount != Decimal("-1"):
+        return summ_with_discount
+    return raw_sum
+
+
+def transaction_signed_amount(tx: dict):
+    amount = get_tx_amount(tx)
+    if amount is None:
+        return None
 
     if amount == Decimal("0"):
         return Decimal("0")
@@ -143,35 +161,39 @@ def transaction_signed_amount(tx: dict) -> Decimal:
 
     direction_fields = ("Direction", "direction", "OperationType", "operationType", "Type", "type")
     direction_value = norm(" ".join(str(tx.get(f, "")) for f in direction_fields))
+
     if any(x in direction_value for x in ("credit", "in", "incoming", "plus", "попов", "зарах", "возврат", "повернен")):
         return abs(amount)
     if any(x in direction_value for x in ("debit", "out", "outgoing", "minus", "спис", "покуп", "оплат")):
         return -abs(amount)
 
-    text = norm(
-        f"{tx.get('goodsName', '')} "
-        f"{tx.get('walletname', '')} "
-        f"{tx.get('cardinfo', '')}"
-    )
+    text = norm(f"{tx.get('goodsName', '')} {tx.get('walletname', '')} {tx.get('cardinfo', '')}")
     if any(k in text for k in WOG_CREDIT_KEYWORDS):
         return abs(amount)
 
     return -abs(amount)
 
 
-def calc_today_delta(transactions: list[dict], wallet_name: str) -> tuple[Decimal, int]:
+def calc_today_delta(transactions: list[dict], wallet_name: str):
     delta = Decimal("0")
     used = 0
+    skipped_pending = 0
     wallet_name_n = norm(wallet_name)
 
     for tx in transactions:
         tx_wallet_name = norm(tx.get("walletname", ""))
         if wallet_name_n and tx_wallet_name and tx_wallet_name != wallet_name_n:
             continue
-        delta += transaction_signed_amount(tx)
+
+        signed = transaction_signed_amount(tx)
+        if signed is None:
+            skipped_pending += 1
+            continue
+
+        delta += signed
         used += 1
 
-    return delta, used
+    return delta, used, skipped_pending
 
 
 def main() -> None:
@@ -184,12 +206,12 @@ def main() -> None:
 
     now_local = now_in_tz()
     request_date = now_local.strftime("%Y%m%d")
-    base_body = {"date": request_date, "version": "1.0"}
+    body = {"date": request_date, "version": "1.0"}
 
     logging.info("Проверка баланса WOG. date=%s tz=%s mode=%s", request_date, WOG_TIMEZONE, WOG_BALANCE_MODE)
 
     try:
-        wr = wog_post(wog_api_url, "WalletsRemains", base_body)
+        wr = wog_post(wog_api_url, "WalletsRemains", body)
         remains = wr.get("remains", [])
         if not isinstance(remains, list) or not remains:
             raise RuntimeError("WOG API: пустой remains")
@@ -202,58 +224,47 @@ def main() -> None:
             raise RuntimeError(f"UAH кошельки не найдены. remains={remains}")
 
         wallet = select_wallet(uah_wallets)
-
         opening_balance = parse_decimal(wallet.get("Value", 0))
-        balance_for_alert = opening_balance
+        balance_for_check = opening_balance
         tx_delta = Decimal("0")
         tx_used = 0
+        tx_skipped_pending = 0
         method = "OPENING"
 
         if WOG_BALANCE_MODE == "OPENING_PLUS_TX":
             try:
-                tr = wog_post(wog_api_url, "Transaction", base_body)
+                tr = wog_post(wog_api_url, "Transaction", body)
                 transactions = tr.get("transactions", [])
                 if isinstance(transactions, list):
-                    tx_delta, tx_used = calc_today_delta(transactions, str(wallet.get("WalletName", "")))
-                    balance_for_alert = opening_balance + tx_delta
+                    tx_delta, tx_used, tx_skipped_pending = calc_today_delta(
+                        transactions,
+                        str(wallet.get("WalletName", ""))
+                    )
+                    balance_for_check = opening_balance + tx_delta
                     method = "OPENING_PLUS_TX"
                     if DEBUG_WOG:
                         logging.info("RAW transactions: %s", json.dumps(transactions, ensure_ascii=False))
-                else:
-                    logging.warning("Transaction: нет списка transactions, используем OPENING.")
             except Exception as tx_err:
                 logging.warning("Не удалось учесть Transaction (%s). Используем OPENING.", tx_err)
 
         logging.info(
-            "Кошелек: WalletCode=%s WalletName=%s Goods=%s Opening=%s DeltaTx=%s UsedTx=%s Balance=%s Method=%s",
+            "WalletCode=%s WalletName=%s Opening=%s DeltaTx=%s UsedTx=%s SkippedPending=%s BalanceForCheck=%s Method=%s",
             wallet.get("WalletCode"),
             wallet.get("WalletName"),
-            wallet.get("GoodsName"),
             fmt_money(opening_balance),
             fmt_money(tx_delta),
             tx_used,
-            fmt_money(balance_for_alert),
+            tx_skipped_pending,
+            fmt_money(balance_for_check),
             method
         )
 
-        if balance_for_alert < BALANCE_THRESHOLD:
-            lines = [
-                "🚨 *Внимание!* 🚨",
-                "",
-                "Баланс на счету WOG упал ниже порога.",
-                "",
-                f"Дата запроса ({WOG_TIMEZONE}): *{now_local.strftime('%Y-%m-%d %H:%M:%S')}*",
-                f"Баланс для проверки: *{fmt_money(balance_for_alert)} грн.*",
-                f"Остаток на начало дня: *{fmt_money(opening_balance)} грн.*",
-            ]
-            if method == "OPENING_PLUS_TX":
-                lines.append(f"Дельта транзакций за день: *{fmt_money(tx_delta)} грн.*")
-            lines.extend([
-                f"Установленный порог: *{fmt_money(BALANCE_THRESHOLD)} грн.*",
-                "",
-                "Пора пополнить счет!"
-            ])
-            send_telegram_message(tg_api_url, "\n".join(lines), TELEGRAM_CHAT_ID)
+        if balance_for_check < BALANCE_THRESHOLD:
+            message = (
+                "🚨 *Внимание!* 🚨\n\n"
+                f"Баланс для проверки: *{fmt_money(balance_for_check)} грн.*"
+            )
+            send_telegram_message(tg_api_url, message, TELEGRAM_CHAT_ID)
         else:
             logging.info("Баланс в норме (>= %s грн).", fmt_money(BALANCE_THRESHOLD))
 
