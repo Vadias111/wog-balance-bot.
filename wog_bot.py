@@ -1,86 +1,184 @@
-import requests
-import logging
 import os
-import datetime
+import logging
+import datetime as dt
+from decimal import Decimal, InvalidOperation
+
+import requests
+
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # pip install backports.zoneinfo
+
 
 # --- НАСТРОЙКИ ---
-# Теперь мы берем ключи из секретов GitHub, а не пишем их в коде
-WOG_API_KEY = os.environ.get('WOG_API_KEY')
-TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
-TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+WOG_API_KEY = os.environ.get("WOG_API_KEY")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-# Порог можно оставить здесь или тоже вынести в секреты
-BALANCE_THRESHOLD = 110000.0
+# Можно задать через env, иначе значение по умолчанию
+BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "110000.00"))
+
+# Таймзона для правильной даты запроса в WOG API
+WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
+
+# Опционально: ID конкретного кошелька, чтобы НЕ суммировать все гривневые
+# (если не задан, будет сумма всех UAH-кошельков)
+WOG_WALLET_ID = os.environ.get("WOG_WALLET_ID")
+
+REQUEST_TIMEOUT = 30
 # --- КОНЕЦ НАСТРОЕК ---
 
-# Настройка логирования для вывода информации в консоль
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
 
-def send_telegram_message(api_url, message, chat_id):
-    """Отправляет сообщение в Telegram и проверяет результат."""
-    payload = {'chat_id': chat_id, 'text': message, 'parse_mode': 'Markdown'}
+
+def parse_decimal(value) -> Decimal:
+    """Безопасно преобразует строку/число в Decimal (учитывает ',' и пробелы)."""
+    if value is None:
+        return Decimal("0")
+    s = str(value).strip().replace(" ", "").replace("\u00A0", "").replace(",", ".")
     try:
-        response = requests.post(api_url, data=payload)
-        # Проверяем, что Telegram API вернул успешный статус
-        if response.status_code == 200:
-            logging.info("Уведомление в Telegram успешно отправлено.")
-        else:
-            # Логируем ошибку от Telegram
-            logging.error(f"Ошибка отправки в Telegram: {response.status_code} - {response.text}")
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Сетевая ошибка при отправке в Telegram: {e}")
+        return Decimal(s)
+    except InvalidOperation:
+        return Decimal("0")
 
-def main():
-    """Основная функция, которая выполняет всю логику."""
+
+def fmt_money(amount: Decimal) -> str:
+    """Форматирует сумму с 2 знаками и пробелами-разделителями тысяч."""
+    return f"{amount:,.2f}".replace(",", " ")
+
+
+def send_telegram_message(api_url: str, message: str, chat_id: str) -> None:
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    try:
+        resp = requests.post(api_url, data=payload, timeout=REQUEST_TIMEOUT)
+        if resp.status_code == 200:
+            logging.info("Уведомление в Telegram отправлено.")
+        else:
+            logging.error("Ошибка Telegram API: %s - %s", resp.status_code, resp.text)
+    except requests.exceptions.RequestException as e:
+        logging.error("Сетевая ошибка при отправке в Telegram: %s", e)
+
+
+def main() -> None:
     if not all([WOG_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID]):
-        logging.error("Одна или несколько переменных окружения (WOG_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID) не установлены.")
+        logging.error(
+            "Не заданы переменные окружения: WOG_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID"
+        )
         return
 
-    WOG_API_URL = f"https://api-fuelcards.wog.ua/{WOG_API_KEY}"
-    TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    wog_api_url = f"https://api-fuelcards.wog.ua/{WOG_API_KEY}"
+    telegram_api_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+    now_local = dt.datetime.now(ZoneInfo(WOG_TIMEZONE))
+    request_date = now_local.strftime("%Y%m%d")
 
     logging.info("Проверка баланса WOG...")
-    headers = {'Content-Type': 'application/json'}
+    logging.info("Дата запроса в WOG: %s (%s)", request_date, WOG_TIMEZONE)
+
+    headers = {"Content-Type": "application/json"}
     data = {
-        "date": datetime.datetime.now().strftime("%Y%m%d"),
+        "date": request_date,
         "version": "1.0"
     }
 
     try:
-        response = requests.post(WOG_API_URL, headers=headers, json=data, params={'Action': 'WalletsRemains'})
-        response.raise_for_status() # Проверка на HTTP-ошибки
+        resp = requests.post(
+            wog_api_url,
+            headers=headers,
+            json=data,
+            params={"Action": "WalletsRemains"},
+            timeout=REQUEST_TIMEOUT
+        )
+        resp.raise_for_status()
+        response_data = resp.json()
 
-        response_data = response.json()
-        if response_data.get("status") == 0 and "remains" in response_data:
-            # Находим ВСЕ гривневые кошельки, а не только первый
-            uah_wallets = [wallet for wallet in response_data["remains"] if wallet.get("GoodsName") == "Грн"]
+        if str(response_data.get("status")) != "0":
+            logging.error("WOG API вернуло ошибку: %s", response_data)
+            return
 
-            if uah_wallets:
-                # Суммируем балансы всех найденных кошельков
-                current_balance = sum(float(wallet.get("Value", 0.0)) for wallet in uah_wallets)
-                logging.info(f"Общий баланс: {current_balance:.2f} грн.")
+        remains = response_data.get("remains", [])
+        if not isinstance(remains, list) or not remains:
+            logging.warning("В ответе WOG нет списка 'remains' или он пуст.")
+            return
 
-                if current_balance < BALANCE_THRESHOLD:
-                    message = (
-                        f"🚨 *Внимание!* 🚨\n\n"
-                        f"Баланс на счету WOG упал ниже порога.\n\n"
-                        f"Текущий баланс: *{current_balance:.2f} грн.*\n"
-                        f"Установленный порог: *{BALANCE_THRESHOLD:.2f} грн.*\n\n"
-                        f"Пора пополнить счет!"
-                    )
-                    send_telegram_message(TELEGRAM_API_URL, message, TELEGRAM_CHAT_ID)
-                else:
-                    logging.info(f"Баланс в норме (больше или равен {BALANCE_THRESHOLD:.2f} грн).")
-            else:
-                logging.warning("Гривневый кошелек не найден в ответе API.")
+        # Фильтр гривневых кошельков
+        uah_wallets = []
+        for w in remains:
+            goods_name = str(w.get("GoodsName", "")).strip().lower()
+            currency_code = str(w.get("CurrencyCode", "")).strip().upper()
+            if goods_name in {"грн", "uah"} or currency_code in {"UAH", "980"}:
+                uah_wallets.append(w)
+
+        if not uah_wallets:
+            logging.warning("UAH/Грн кошельки не найдены. Доступные кошельки: %s", [
+                {
+                    "WalletId": w.get("WalletId"),
+                    "GoodsName": w.get("GoodsName"),
+                    "CurrencyCode": w.get("CurrencyCode"),
+                    "Value": w.get("Value")
+                }
+                for w in remains
+            ])
+            return
+
+        # Если указан конкретный кошелек - берем только его
+        selected_wallets = uah_wallets
+        if WOG_WALLET_ID:
+            selected_wallets = [
+                w for w in uah_wallets
+                if str(w.get("WalletId", "")).strip() == WOG_WALLET_ID.strip()
+            ]
+            if not selected_wallets:
+                logging.error(
+                    "Кошелек WOG_WALLET_ID=%s не найден среди UAH кошельков. Найдены: %s",
+                    WOG_WALLET_ID,
+                    [w.get("WalletId") for w in uah_wallets]
+                )
+                return
+
+        current_balance = sum(
+            (parse_decimal(w.get("Value", 0)) for w in selected_wallets),
+            Decimal("0")
+        )
+
+        logging.info("Кошельки в расчете: %s", [
+            {
+                "WalletId": w.get("WalletId"),
+                "GoodsName": w.get("GoodsName"),
+                "Value": w.get("Value")
+            }
+            for w in selected_wallets
+        ])
+        logging.info("Текущий баланс: %s грн", fmt_money(current_balance))
+
+        if current_balance < BALANCE_THRESHOLD:
+            message = (
+                "🚨 *Внимание!* 🚨\n\n"
+                "Баланс на счету WOG упал ниже порога.\n\n"
+                f"Дата запроса ({WOG_TIMEZONE}): *{now_local.strftime('%Y-%m-%d %H:%M:%S')}*\n"
+                f"Текущий баланс: *{fmt_money(current_balance)} грн.*\n"
+                f"Установленный порог: *{fmt_money(BALANCE_THRESHOLD)} грн.*\n\n"
+                "Пора пополнить счет!"
+            )
+            send_telegram_message(telegram_api_url, message, TELEGRAM_CHAT_ID)
         else:
-            logging.error(f"API WOG вернуло ошибку: {response_data.get('error', 'Неизвестная ошибка')}")
+            logging.info("Баланс в норме (>= %s грн).", fmt_money(BALANCE_THRESHOLD))
 
     except requests.exceptions.RequestException as e:
-        logging.error(f"Ошибка сети при запросе к WOG: {e}")
+        logging.error("Ошибка сети при запросе к WOG: %s", e)
+    except ValueError as e:
+        logging.error("Ошибка разбора JSON ответа WOG: %s", e)
     except Exception as e:
-        logging.error(f"Произошла непредвиденная ошибка: {e}")
+        logging.error("Непредвиденная ошибка: %s", e)
+
 
 if __name__ == "__main__":
     main()
-
