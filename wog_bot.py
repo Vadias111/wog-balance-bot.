@@ -14,7 +14,7 @@ WOG_API_KEY = os.environ.get("WOG_API_KEY")
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
-BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "110000.00"))
+BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "40000.00"))
 WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
 
 # Для WalletsRemains нужен именно WalletCode (UUID)
@@ -280,3 +280,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
