@@ -20,9 +20,7 @@ WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
 # Для WalletsRemains нужен именно WalletCode (UUID)
 WOG_WALLET_CODE = os.environ.get("WOG_WALLET_CODE")
 
-# Не учитывать транзакции, где данные еще не готовы (по доке: -1)
-WOG_INCLUDE_PENDING_TX = os.environ.get("WOG_INCLUDE_PENDING_TX", "0") == "1"
-
+# Ключевые слова для входящих операций, если нет явного направления
 WOG_CREDIT_KEYWORDS = [
     x.strip().lower()
     for x in os.environ.get(
@@ -97,7 +95,7 @@ def wog_post(wog_api_url: str, action: str, body: dict) -> dict:
     return data
 
 
-def pick_uah_wallets(remains: list[dict]) -> list[dict]:
+def pick_uah_wallets(remains: list) -> list:
     wallets = []
     for w in remains:
         goods_name = norm(w.get("GoodsName", ""))
@@ -108,12 +106,9 @@ def pick_uah_wallets(remains: list[dict]) -> list[dict]:
     return wallets
 
 
-def select_wallet(uah_wallets: list[dict]) -> dict:
+def select_wallet(uah_wallets: list) -> dict:
     if WOG_WALLET_CODE:
-        selected = [
-            w for w in uah_wallets
-            if str(w.get("WalletCode", "")).strip() == WOG_WALLET_CODE.strip()
-        ]
+        selected = [w for w in uah_wallets if str(w.get("WalletCode", "")).strip() == WOG_WALLET_CODE.strip()]
         if not selected:
             raise RuntimeError(
                 f"WOG_WALLET_CODE={WOG_WALLET_CODE} не найден. "
@@ -130,19 +125,18 @@ def select_wallet(uah_wallets: list[dict]) -> dict:
 
 
 def get_tx_amount(tx: dict) -> Optional[Decimal]:
+    # 1) если итоговая сумма готова - берем ее
     summ_with_discount = parse_decimal(tx.get("summwithdiscount", -1))
-    discount = parse_decimal(tx.get("discount", 0))
-    raw_sum = parse_decimal(tx.get("sum", 0))
-
-    if not WOG_INCLUDE_PENDING_TX and (
-        summ_with_discount == Decimal("-1") or discount == Decimal("-1")
-    ):
-        return None
-
     if summ_with_discount != Decimal("-1"):
         return summ_with_discount
 
-    return raw_sum
+    # 2) если итоговая еще не готова, берем сырой sum
+    raw_sum = parse_decimal(tx.get("sum", 0))
+    if raw_sum != Decimal("0"):
+        return raw_sum
+
+    # 3) суммы нет
+    return None
 
 
 def transaction_signed_amount(tx: dict) -> Optional[Decimal]:
@@ -168,14 +162,15 @@ def transaction_signed_amount(tx: dict) -> Optional[Decimal]:
     if any(k in text for k in WOG_CREDIT_KEYWORDS):
         return abs(amount)
 
-    # По умолчанию считаем как расход
+    # По умолчанию считаем расходом
     return -abs(amount)
 
 
-def calc_today_delta(transactions: list[dict], wallet_name: str) -> Tuple[Decimal, int, int]:
+def calc_today_delta(transactions: list, wallet_name: str) -> Tuple[Decimal, int, int, int]:
     delta = Decimal("0")
+    matched = 0
     used = 0
-    skipped_pending = 0
+    no_amount = 0
     wallet_name_n = norm(wallet_name)
 
     for tx in transactions:
@@ -183,15 +178,16 @@ def calc_today_delta(transactions: list[dict], wallet_name: str) -> Tuple[Decima
         if wallet_name_n and tx_wallet_name and tx_wallet_name != wallet_name_n:
             continue
 
+        matched += 1
         signed = transaction_signed_amount(tx)
         if signed is None:
-            skipped_pending += 1
+            no_amount += 1
             continue
 
         delta += signed
         used += 1
 
-    return delta, used, skipped_pending
+    return delta, matched, used, no_amount
 
 
 def main() -> None:
@@ -229,32 +225,37 @@ def main() -> None:
         tr = wog_post(wog_api_url, "Transaction", body)
         transactions = tr.get("transactions", [])
         if not isinstance(transactions, list):
-            logging.error("Transaction не вернул список transactions. Прерываю отправку.")
+            logging.error("Transaction не вернул список transactions. Не отправляю уведомление.")
             return
 
         if DEBUG_WOG:
             logging.info("RAW transactions: %s", json.dumps(transactions, ensure_ascii=False))
 
-        tx_delta, tx_used, tx_skipped_pending = calc_today_delta(
+        tx_delta, tx_matched, tx_used, tx_no_amount = calc_today_delta(
             transactions,
             str(wallet.get("WalletName", ""))
         )
 
-        # Без транзакций не отправляем, чтобы не падать обратно на "остаток на начало дня"
-        if tx_used == 0 and tx_skipped_pending == 0:
-            logging.error("По кошельку нет транзакций за дату. Прерываю отправку.")
+        # Важная защита: если транзакции есть, но ни одну нельзя посчитать — не отправляем
+        if tx_matched > 0 and tx_used == 0:
+            logging.error(
+                "Найдены транзакции (%s), но суммы недоступны (%s). "
+                "Чтобы не показывать баланс на 00:00, уведомление не отправляется.",
+                tx_matched, tx_no_amount
+            )
             return
 
         balance_for_check = opening_balance + tx_delta
 
         logging.info(
-            "WalletCode=%s WalletName=%s Opening=%s DeltaTx=%s UsedTx=%s SkippedPending=%s BalanceForCheck=%s",
+            "WalletCode=%s WalletName=%s Opening=%s DeltaTx=%s MatchedTx=%s UsedTx=%s NoAmountTx=%s BalanceForCheck=%s",
             wallet.get("WalletCode"),
             wallet.get("WalletName"),
             fmt_money(opening_balance),
             fmt_money(tx_delta),
+            tx_matched,
             tx_used,
-            tx_skipped_pending,
+            tx_no_amount,
             fmt_money(balance_for_check)
         )
 
