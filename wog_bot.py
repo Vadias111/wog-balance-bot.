@@ -5,11 +5,7 @@ import datetime as dt
 from decimal import Decimal, InvalidOperation
 
 import requests
-
-try:
-    from zoneinfo import ZoneInfo
-except Exception:
-    ZoneInfo = None
+from zoneinfo import ZoneInfo
 
 
 # --- ENV ---
@@ -19,9 +15,22 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
 BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "110000.00"))
 WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
-WOG_WALLET_ID = os.environ.get("WOG_WALLET_ID")  # РЕКОМЕНДУЕТСЯ задать обязательно
-DEBUG_WOG = os.environ.get("DEBUG_WOG", "0") == "1"
 
+# WalletsRemains использует WalletCode (UUID), а не WalletId
+WOG_WALLET_CODE = os.environ.get("WOG_WALLET_CODE") or os.environ.get("WOG_WALLET_ID")
+
+# OPENING - только остаток на начало дня
+# OPENING_PLUS_TX - остаток на начало дня + транзакции за день (оценка)
+WOG_BALANCE_MODE = os.environ.get("WOG_BALANCE_MODE", "OPENING_PLUS_TX").upper()
+
+# Ключевые слова для входящих операций (если в транзакции нет явного направления)
+WOG_CREDIT_KEYWORDS = [
+    w.strip().lower()
+    for w in os.environ.get("WOG_CREDIT_KEYWORDS", "попов,зарах,возврат,повернен,коригув").split(",")
+    if w.strip()
+]
+
+DEBUG_WOG = os.environ.get("DEBUG_WOG", "0") == "1"
 REQUEST_TIMEOUT = 30
 # --- /ENV ---
 
@@ -46,6 +55,18 @@ def fmt_money(amount: Decimal) -> str:
     return f"{amount:,.2f}".replace(",", " ")
 
 
+def norm(s: str) -> str:
+    return " ".join(str(s or "").strip().lower().split())
+
+
+def now_in_tz() -> dt.datetime:
+    try:
+        return dt.datetime.now(ZoneInfo(WOG_TIMEZONE))
+    except Exception:
+        logging.warning("Не удалось применить таймзону %s, используем локальную.", WOG_TIMEZONE)
+        return dt.datetime.now()
+
+
 def send_telegram_message(api_url: str, message: str, chat_id: str) -> None:
     payload = {
         "chat_id": chat_id,
@@ -62,71 +83,95 @@ def send_telegram_message(api_url: str, message: str, chat_id: str) -> None:
         logging.error("Сетевая ошибка Telegram: %s", e)
 
 
+def wog_post(wog_api_url: str, action: str, body: dict) -> dict:
+    headers = {"Content-Type": "application/json"}
+    r = requests.post(
+        wog_api_url,
+        headers=headers,
+        json=body,
+        params={"Action": action},
+        timeout=REQUEST_TIMEOUT
+    )
+    r.raise_for_status()
+    data = r.json()
+    if str(data.get("status")) != "0":
+        raise RuntimeError(f"WOG API error (Action={action}): {data}")
+    return data
+
+
 def pick_uah_wallets(remains: list[dict]) -> list[dict]:
     wallets = []
     for w in remains:
-        goods = str(w.get("GoodsName", "")).strip().lower()
-        code = str(w.get("CurrencyCode", "")).strip().upper()
-        if goods in {"грн", "uah"} or code in {"UAH", "980"}:
+        goods_name = norm(w.get("GoodsName", ""))
+        goods_code = str(w.get("GoodsCode", "")).strip()
+        currency_code = str(w.get("CurrencyCode", "")).strip().upper()
+        if goods_name in {"грн", "uah"} or goods_code == "980" or currency_code in {"UAH", "980"}:
             wallets.append(w)
     return wallets
 
 
-def calc_available_balance(wallet: dict) -> tuple[Decimal, str]:
-    # 1) Приоритет: явные поля "доступно"
-    direct_available_keys = [
-        "Available",
-        "AvailableValue",
-        "AvailableSum",
-        "SumAvailable",
-        "RestAvailable",
-        "ValueAvailable",
-        "FreeValue",
-        "BalanceAvailable",
-        "SaldoAvailable",
-    ]
-    for key in direct_available_keys:
-        if key in wallet and str(wallet.get(key)).strip() not in {"", "None"}:
-            return parse_decimal(wallet.get(key)), f"direct:{key}"
+def select_wallet(uah_wallets: list[dict]) -> dict:
+    if WOG_WALLET_CODE:
+        selected = [
+            w for w in uah_wallets
+            if str(w.get("WalletCode", "")).strip() == WOG_WALLET_CODE.strip()
+        ]
+        if not selected:
+            raise RuntimeError(
+                f"WOG_WALLET_CODE={WOG_WALLET_CODE} не найден. "
+                f"Доступные WalletCode: {[w.get('WalletCode') for w in uah_wallets]}"
+            )
+        return selected[0]
 
-    # 2) Если явного "доступно" нет: Value - блокировки/резервы
-    total = parse_decimal(wallet.get("Value", 0))
-    blocked_keys = [
-        "Blocked",
-        "BlockedValue",
-        "BlockedSum",
-        "Reserve",
-        "Reserved",
-        "ReservedValue",
-        "Hold",
-        "OnHold",
-        "Frozen",
-        "NotAvailable",
-    ]
-    blocked = Decimal("0")
-    used = []
-    for key in blocked_keys:
-        if key in wallet and str(wallet.get(key)).strip() not in {"", "None"}:
-            v = parse_decimal(wallet.get(key))
-            blocked += v
-            used.append(f"{key}={v}")
-
-    if blocked > 0:
-        return total - blocked, f"value-minus-blocked:{';'.join(used)}"
-
-    # 3) Фолбэк
-    return total, "fallback:Value"
+    if len(uah_wallets) != 1:
+        raise RuntimeError(
+            f"Найдено UAH кошельков: {len(uah_wallets)}. "
+            f"Укажите WOG_WALLET_CODE. Доступные: {[w.get('WalletCode') for w in uah_wallets]}"
+        )
+    return uah_wallets[0]
 
 
-def now_in_tz() -> dt.datetime:
-    if ZoneInfo is None:
-        # На старом Python без zoneinfo
-        return dt.datetime.now()
-    try:
-        return dt.datetime.now(ZoneInfo(WOG_TIMEZONE))
-    except Exception:
-        logging.warning("Не удалось применить таймзону %s, используем локальную.", WOG_TIMEZONE)
-        return dt.datetime.now()
+def transaction_signed_amount(tx: dict) -> Decimal:
+    amount = parse_decimal(tx.get("summwithdiscount", tx.get("sum", 0)))
+    if amount == Decimal("-1"):
+        amount = parse_decimal(tx.get("sum", 0))
+
+    if amount == Decimal("0"):
+        return Decimal("0")
+    if amount < 0:
+        return amount
+
+    direction_fields = ("Direction", "direction", "OperationType", "operationType", "Type", "type")
+    direction_value = norm(" ".join(str(tx.get(f, "")) for f in direction_fields))
+    if any(x in direction_value for x in ("credit", "in", "incoming", "plus", "попов", "зарах", "возврат", "повернен")):
+        return abs(amount)
+    if any(x in direction_value for x in ("debit", "out", "outgoing", "minus", "спис", "покуп", "оплат")):
+        return -abs(amount)
+
+    text = norm(
+        f"{tx.get('goodsName', '')} "
+        f"{tx.get('walletname', '')} "
+        f"{tx.get('cardinfo', '')}"
+    )
+    if any(k in text for k in WOG_CREDIT_KEYWORDS):
+        return abs(amount)
+
+    return -abs(amount)
+
+
+def calc_today_delta(transactions: list[dict], wallet_name: str) -> tuple[Decimal, int]:
+    delta = Decimal("0")
+    used = 0
+    wallet_name_n = norm(wallet_name)
+
+    for tx in transactions:
+        tx_wallet_name = norm(tx.get("walletname", ""))
+        if wallet_name_n and tx_wallet_name and tx_wallet_name != wallet_name_n:
+            continue
+        delta += transaction_signed_amount(tx)
+        used += 1
+
+    return delta, used
 
 
 def main() -> None:
@@ -139,102 +184,78 @@ def main() -> None:
 
     now_local = now_in_tz()
     request_date = now_local.strftime("%Y%m%d")
+    base_body = {"date": request_date, "version": "1.0"}
 
-    payload = {
-        "date": request_date,
-        "version": "1.0"
-    }
-    headers = {"Content-Type": "application/json"}
-
-    logging.info("Проверка баланса WOG. date=%s tz=%s", request_date, WOG_TIMEZONE)
+    logging.info("Проверка баланса WOG. date=%s tz=%s mode=%s", request_date, WOG_TIMEZONE, WOG_BALANCE_MODE)
 
     try:
-        r = requests.post(
-            wog_api_url,
-            headers=headers,
-            json=payload,
-            params={"Action": "WalletsRemains"},
-            timeout=REQUEST_TIMEOUT
-        )
-        r.raise_for_status()
-        data = r.json()
-
-        if str(data.get("status")) != "0":
-            logging.error("WOG API error: %s", data)
-            return
-
-        remains = data.get("remains", [])
+        wr = wog_post(wog_api_url, "WalletsRemains", base_body)
+        remains = wr.get("remains", [])
         if not isinstance(remains, list) or not remains:
-            logging.error("WOG API: пустой remains")
-            return
+            raise RuntimeError("WOG API: пустой remains")
 
         if DEBUG_WOG:
             logging.info("RAW remains: %s", json.dumps(remains, ensure_ascii=False))
 
         uah_wallets = pick_uah_wallets(remains)
         if not uah_wallets:
-            logging.error("UAH кошельки не найдены. remains=%s", remains)
-            return
+            raise RuntimeError(f"UAH кошельки не найдены. remains={remains}")
 
-        # Не суммируем молча все кошельки: это частая причина неверной суммы.
-        if WOG_WALLET_ID:
-            selected = [w for w in uah_wallets if str(w.get("WalletId", "")).strip() == WOG_WALLET_ID.strip()]
-            if not selected:
-                logging.error(
-                    "WOG_WALLET_ID=%s не найден. Доступные UAH WalletId: %s",
-                    WOG_WALLET_ID,
-                    [w.get("WalletId") for w in uah_wallets]
-                )
-                return
-        else:
-            if len(uah_wallets) > 1:
-                logging.error(
-                    "Найдено несколько UAH кошельков (%s). Укажите WOG_WALLET_ID, чтобы не получить неверный баланс.",
-                    len(uah_wallets)
-                )
-                for w in uah_wallets:
-                    bal, method = calc_available_balance(w)
-                    logging.info(
-                        "UAH wallet: WalletId=%s Name=%s GoodsName=%s Value=%s AvailableCalc=%s Method=%s Keys=%s",
-                        w.get("WalletId"),
-                        w.get("WalletName") or w.get("Name"),
-                        w.get("GoodsName"),
-                        w.get("Value"),
-                        bal,
-                        method,
-                        list(w.keys())
-                    )
-                return
-            selected = [uah_wallets[0]]
+        wallet = select_wallet(uah_wallets)
 
-        total_available = Decimal("0")
-        details = []
-        for w in selected:
-            available, method = calc_available_balance(w)
-            total_available += available
-            details.append({
-                "WalletId": w.get("WalletId"),
-                "WalletName": w.get("WalletName") or w.get("Name"),
-                "Value": str(w.get("Value")),
-                "AvailableCalc": str(available),
-                "Method": method
-            })
+        opening_balance = parse_decimal(wallet.get("Value", 0))
+        balance_for_alert = opening_balance
+        tx_delta = Decimal("0")
+        tx_used = 0
+        method = "OPENING"
 
-        logging.info("Кошельки в расчете: %s", details)
-        logging.info("Доступный баланс: %s грн", fmt_money(total_available))
+        if WOG_BALANCE_MODE == "OPENING_PLUS_TX":
+            try:
+                tr = wog_post(wog_api_url, "Transaction", base_body)
+                transactions = tr.get("transactions", [])
+                if isinstance(transactions, list):
+                    tx_delta, tx_used = calc_today_delta(transactions, str(wallet.get("WalletName", "")))
+                    balance_for_alert = opening_balance + tx_delta
+                    method = "OPENING_PLUS_TX"
+                    if DEBUG_WOG:
+                        logging.info("RAW transactions: %s", json.dumps(transactions, ensure_ascii=False))
+                else:
+                    logging.warning("Transaction: нет списка transactions, используем OPENING.")
+            except Exception as tx_err:
+                logging.warning("Не удалось учесть Transaction (%s). Используем OPENING.", tx_err)
 
-        if total_available < BALANCE_THRESHOLD:
-            message = (
-                "🚨 *Внимание!* 🚨\n\n"
-                "Баланс на счету WOG упал ниже порога.\n\n"
-                f"Дата запроса ({WOG_TIMEZONE}): *{now_local.strftime('%Y-%m-%d %H:%M:%S')}*\n"
-                f"Текущий баланс: *{fmt_money(total_available)} грн.*\n"
-                f"Установленный порог: *{fmt_money(BALANCE_THRESHOLD)} грн.*\n\n"
+        logging.info(
+            "Кошелек: WalletCode=%s WalletName=%s Goods=%s Opening=%s DeltaTx=%s UsedTx=%s Balance=%s Method=%s",
+            wallet.get("WalletCode"),
+            wallet.get("WalletName"),
+            wallet.get("GoodsName"),
+            fmt_money(opening_balance),
+            fmt_money(tx_delta),
+            tx_used,
+            fmt_money(balance_for_alert),
+            method
+        )
+
+        if balance_for_alert < BALANCE_THRESHOLD:
+            lines = [
+                "🚨 *Внимание!* 🚨",
+                "",
+                "Баланс на счету WOG упал ниже порога.",
+                "",
+                f"Дата запроса ({WOG_TIMEZONE}): *{now_local.strftime('%Y-%m-%d %H:%M:%S')}*",
+                f"Баланс для проверки: *{fmt_money(balance_for_alert)} грн.*",
+                f"Остаток на начало дня: *{fmt_money(opening_balance)} грн.*",
+            ]
+            if method == "OPENING_PLUS_TX":
+                lines.append(f"Дельта транзакций за день: *{fmt_money(tx_delta)} грн.*")
+            lines.extend([
+                f"Установленный порог: *{fmt_money(BALANCE_THRESHOLD)} грн.*",
+                "",
                 "Пора пополнить счет!"
-            )
-            send_telegram_message(tg_api_url, message, TELEGRAM_CHAT_ID)
+            ])
+            send_telegram_message(tg_api_url, "\n".join(lines), TELEGRAM_CHAT_ID)
         else:
-            logging.info("Баланс в норме (>= %s грн)", fmt_money(BALANCE_THRESHOLD))
+            logging.info("Баланс в норме (>= %s грн).", fmt_money(BALANCE_THRESHOLD))
 
     except requests.exceptions.RequestException as e:
         logging.error("Ошибка сети WOG: %s", e)
