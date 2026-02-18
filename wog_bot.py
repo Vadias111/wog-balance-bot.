@@ -3,6 +3,7 @@ import json
 import logging
 import datetime as dt
 from decimal import Decimal, InvalidOperation
+from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import requests
@@ -16,17 +17,12 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 BALANCE_THRESHOLD = Decimal(os.environ.get("BALANCE_THRESHOLD", "110000.00"))
 WOG_TIMEZONE = os.environ.get("WOG_TIMEZONE", "Europe/Kyiv")
 
-# Для WalletsRemains нужен WalletCode (UUID), не WalletId
-WOG_WALLET_CODE = os.environ.get("WOG_WALLET_CODE") or os.environ.get("WOG_WALLET_ID")
+# Для WalletsRemains нужен именно WalletCode (UUID)
+WOG_WALLET_CODE = os.environ.get("WOG_WALLET_CODE")
 
-# OPENING - остаток на начало дня
-# OPENING_PLUS_TX - остаток на начало дня + дельта транзакций за день
-WOG_BALANCE_MODE = os.environ.get("WOG_BALANCE_MODE", "OPENING_PLUS_TX").upper()
-
-# Не учитывать "pending" транзакции, где по доке данные еще не готовы
+# Не учитывать транзакции, где данные еще не готовы (по доке: -1)
 WOG_INCLUDE_PENDING_TX = os.environ.get("WOG_INCLUDE_PENDING_TX", "0") == "1"
 
-# Ключевые слова для входящих операций (если нет явного направления)
 WOG_CREDIT_KEYWORDS = [
     x.strip().lower()
     for x in os.environ.get(
@@ -133,12 +129,11 @@ def select_wallet(uah_wallets: list[dict]) -> dict:
     return uah_wallets[0]
 
 
-def get_tx_amount(tx: dict):
+def get_tx_amount(tx: dict) -> Optional[Decimal]:
     summ_with_discount = parse_decimal(tx.get("summwithdiscount", -1))
     discount = parse_decimal(tx.get("discount", 0))
     raw_sum = parse_decimal(tx.get("sum", 0))
 
-    # По документации: -1 = данных еще нет (до 24 часов)
     if not WOG_INCLUDE_PENDING_TX and (
         summ_with_discount == Decimal("-1") or discount == Decimal("-1")
     ):
@@ -146,10 +141,11 @@ def get_tx_amount(tx: dict):
 
     if summ_with_discount != Decimal("-1"):
         return summ_with_discount
+
     return raw_sum
 
 
-def transaction_signed_amount(tx: dict):
+def transaction_signed_amount(tx: dict) -> Optional[Decimal]:
     amount = get_tx_amount(tx)
     if amount is None:
         return None
@@ -164,6 +160,7 @@ def transaction_signed_amount(tx: dict):
 
     if any(x in direction_value for x in ("credit", "in", "incoming", "plus", "попов", "зарах", "возврат", "повернен")):
         return abs(amount)
+
     if any(x in direction_value for x in ("debit", "out", "outgoing", "minus", "спис", "покуп", "оплат")):
         return -abs(amount)
 
@@ -171,10 +168,11 @@ def transaction_signed_amount(tx: dict):
     if any(k in text for k in WOG_CREDIT_KEYWORDS):
         return abs(amount)
 
+    # По умолчанию считаем как расход
     return -abs(amount)
 
 
-def calc_today_delta(transactions: list[dict], wallet_name: str):
+def calc_today_delta(transactions: list[dict], wallet_name: str) -> Tuple[Decimal, int, int]:
     delta = Decimal("0")
     used = 0
     skipped_pending = 0
@@ -208,9 +206,10 @@ def main() -> None:
     request_date = now_local.strftime("%Y%m%d")
     body = {"date": request_date, "version": "1.0"}
 
-    logging.info("Проверка баланса WOG. date=%s tz=%s mode=%s", request_date, WOG_TIMEZONE, WOG_BALANCE_MODE)
+    logging.info("Проверка баланса WOG. date=%s tz=%s", request_date, WOG_TIMEZONE)
 
     try:
+        # 1) Остаток на начало дня
         wr = wog_post(wog_api_url, "WalletsRemains", body)
         remains = wr.get("remains", [])
         if not isinstance(remains, list) or not remains:
@@ -225,38 +224,38 @@ def main() -> None:
 
         wallet = select_wallet(uah_wallets)
         opening_balance = parse_decimal(wallet.get("Value", 0))
-        balance_for_check = opening_balance
-        tx_delta = Decimal("0")
-        tx_used = 0
-        tx_skipped_pending = 0
-        method = "OPENING"
 
-        if WOG_BALANCE_MODE == "OPENING_PLUS_TX":
-            try:
-                tr = wog_post(wog_api_url, "Transaction", body)
-                transactions = tr.get("transactions", [])
-                if isinstance(transactions, list):
-                    tx_delta, tx_used, tx_skipped_pending = calc_today_delta(
-                        transactions,
-                        str(wallet.get("WalletName", ""))
-                    )
-                    balance_for_check = opening_balance + tx_delta
-                    method = "OPENING_PLUS_TX"
-                    if DEBUG_WOG:
-                        logging.info("RAW transactions: %s", json.dumps(transactions, ensure_ascii=False))
-            except Exception as tx_err:
-                logging.warning("Не удалось учесть Transaction (%s). Используем OPENING.", tx_err)
+        # 2) Дельта транзакций за день
+        tr = wog_post(wog_api_url, "Transaction", body)
+        transactions = tr.get("transactions", [])
+        if not isinstance(transactions, list):
+            logging.error("Transaction не вернул список transactions. Прерываю отправку.")
+            return
+
+        if DEBUG_WOG:
+            logging.info("RAW transactions: %s", json.dumps(transactions, ensure_ascii=False))
+
+        tx_delta, tx_used, tx_skipped_pending = calc_today_delta(
+            transactions,
+            str(wallet.get("WalletName", ""))
+        )
+
+        # Без транзакций не отправляем, чтобы не падать обратно на "остаток на начало дня"
+        if tx_used == 0 and tx_skipped_pending == 0:
+            logging.error("По кошельку нет транзакций за дату. Прерываю отправку.")
+            return
+
+        balance_for_check = opening_balance + tx_delta
 
         logging.info(
-            "WalletCode=%s WalletName=%s Opening=%s DeltaTx=%s UsedTx=%s SkippedPending=%s BalanceForCheck=%s Method=%s",
+            "WalletCode=%s WalletName=%s Opening=%s DeltaTx=%s UsedTx=%s SkippedPending=%s BalanceForCheck=%s",
             wallet.get("WalletCode"),
             wallet.get("WalletName"),
             fmt_money(opening_balance),
             fmt_money(tx_delta),
             tx_used,
             tx_skipped_pending,
-            fmt_money(balance_for_check),
-            method
+            fmt_money(balance_for_check)
         )
 
         if balance_for_check < BALANCE_THRESHOLD:
